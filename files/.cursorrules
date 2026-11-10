@@ -1,0 +1,77 @@
+# Intelligent Queue & Waiting Time Analyzer - Cursor rules
+
+## Project context
+Production-grade, modular Python 3.10+ project that measures queue length and waiting time
+for smart-campus services (cafeteria, registration desk, library) from video.
+Pipeline: Frame ingestion -> YOLOv8 person detection -> ByteTrack IDs -> feet-point polygon
+filtering -> queue/wait metrics -> congestion alert engine -> OpenCV overlay / Streamlit.
+
+## Tech stack (do not add dependencies without asking)
+- ultralytics (YOLOv8n/s + built-in ByteTrack/BoT-SORT), PyTorch (transitive)
+- opencv-python (NOT headless: the ROI selector and cv2.imshow need the GUI build)
+- numpy, pandas, shapely (optional, with cv2.pointPolygonTest fallback), streamlit
+- Standard library: argparse, logging, dataclasses, csv, json, pathlib
+
+## Module map (single responsibility per file)
+- geometry.py       polygon validation, PolygonZone (point-in-polygon), ROI JSON I/O. No ML imports.
+- video_io.py       FrameSource (files/RTSP/webcam, reconnect), grab_frame, VideoSink.
+- tracker_engine.py QueueAnalyzer, CongestionAlertEngine, dataclasses (configs and results). No drawing, no UI.
+- overlay.py        all cv2 drawing. Pure functions that return a NEW frame; never mutate the input.
+- roi_selector.py   interactive ROI tool -> roi_config.json.
+- main.py           CLI loop only: parse args, wire modules, write outputs.
+- app.py            Streamlit UI only: no detection logic.
+- evaluate.py       offline metrics (MAE, precision/recall) against ground truth CSVs.
+Never put business logic in main.py or app.py; add it to tracker_engine.py or geometry.py.
+
+## Code standards
+- PEP 8, max line length 120, 4-space indent, double quotes, f-strings, `pathlib.Path` for paths.
+- `from __future__ import annotations` at the top of every module.
+- Type hints on EVERY function (parameters and return). Google-style docstrings (Args/Returns/Raises).
+- Use `logging` (module-level `logger = logging.getLogger(__name__)`), never `print` outside CLI result output.
+- Frozen dataclasses for results, plain dataclasses for configs with a `validate()` method.
+- No hardcoded paths, URLs, thresholds or credentials: use CLI args, dataclass defaults or config files.
+- Never use bare `except:`. Catch specific exceptions; `except Exception` only with `# noqa: BLE001` and a reason.
+- Write complete code. No placeholders, no `# TODO`, no `# ... existing code ...`, no truncated functions.
+
+## Computer-vision rules
+- Frames are BGR uint8 numpy arrays. Convert to RGB only at the Streamlit boundary.
+- Position of a person = bottom-center of the bbox: ((x1 + x2) / 2, y2). Never use the bbox center.
+- Polygons: validate with `geometry.validate_polygon` (>= 3 finite points, non-zero area, no self-intersection).
+  ROI JSON stores the frame size; always rescale with `RoiConfig.scaled_polygon(width, height)`.
+- Timestamps are passed INTO the analyzer (video time for files, monotonic clock for streams). Do not call
+  `time.time()` inside analytics logic; it breaks reproducibility.
+- Track IDs: keep per-ID state only for IDs that have been inside the ROI; delete state after the exit grace period
+  to prevent memory growth. Bound every long-lived collection (deque with maxlen).
+- Wait time = last_inside_ts - entry_ts of a completed visit; ignore visits shorter than `min_wait_seconds`.
+- Alerts are debounced: the condition must hold for M consecutive processed frames. Alerts assist a human operator;
+  never automate sanctions or identify people.
+
+## YOLOv8 / OpenCV / memory rules
+- Load the model ONCE per analyzer; never inside the frame loop. Use `model.track(..., persist=True, verbose=False)`.
+- Restrict detection to `classes=[0]` (person). Pass `device`, `half` (CUDA only), `imgsz`, `conf`, `iou` explicitly.
+- Move tensors off the GPU immediately: `.detach().cpu().numpy()`; do not keep ultralytics `Results` objects.
+- On CUDA OOM: `torch.cuda.empty_cache()`, reload the model on CPU, retry once (already in `_run_tracker`).
+- Do not call `torch.cuda.empty_cache()` per frame (it hurts throughput).
+- Always release resources: `cap.release()`, `VideoWriter.release()`, `cv2.destroyAllWindows()` in `finally` or
+  context managers. Validate every frame: `frame is not None and frame.size > 0`.
+- Copy a frame before drawing on it when the original is reused (`frame.copy()`); draw translucent fills with
+  `cv2.addWeighted` on a copy.
+- No ID or face recognition, no biometric data, no persistent storage of raw frames. Only anonymous track IDs
+  and aggregate metrics may be stored.
+
+## Streamlit rules
+- Heavy work (model, video) must never run on every rerun: guard with `st.button` and keep results in `st.session_state`.
+- Use `st.empty()` placeholders for live frames and charts; refresh every N frames, not every frame.
+- Re-evaluate alert thresholds on stored metrics (`replay_alerts`) instead of re-running inference.
+- Write uploads to a temp file once, and delete stale temp files.
+
+## Error-handling rules
+- Missing/invalid frames: skip and log a warning; end of file returns None; RTSP drops trigger reconnection.
+- Invalid ROI or config: raise `PolygonError` / `ValueError` with a message the user can act on.
+- CLI functions return exit codes (0 ok, 1 cancelled, 2 error) and the entry point calls `sys.exit`.
+
+## Testing and workflow conventions
+- When adding a feature: update the dataclass config, CLI flag, Streamlit control and README together.
+- Keep functions under ~60 lines; extract helpers instead of nesting.
+- When asked to modify a file, return the complete updated file, not a diff fragment.
+- Preferred Composer context: `@geometry.py @tracker_engine.py` for logic changes, `@app.py @overlay.py` for UI changes.
